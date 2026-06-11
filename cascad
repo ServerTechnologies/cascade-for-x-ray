@@ -1,0 +1,309 @@
+#!/bin/bash
+
+# =============================================================================
+# Выбор конфига outbound происходит автоматически по значению параметра type:
+#   type=xhttp  → outbound через xhttp (REALITY)
+#   type=tcp    → outbound через tcp   (REALITY + xtls-rprx-vision)
+# =============================================================================
+
+# ─── 1. ПАРСИНГ VLESS-ССЫЛКИ ─────────────────────────────────────────────────
+
+parse_vless() {
+    local url="${1:-}"
+
+    if [[ -z "$url" ]]; then
+        echo "Usage: $0 <vless://...>" >&2
+        exit 1
+    fi
+
+    if [[ "$url" != vless://* ]]; then
+        echo "Error: not a vless:// URL" >&2
+        exit 1
+    fi
+
+    local rest="${url#vless://}"
+
+    # fragment (#name)
+    name=""
+    if [[ "$rest" == *"#"* ]]; then
+        name="${rest##*#}"
+        name=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$name" 2>/dev/null || printf '%s' "$name")
+        rest="${rest%%#*}"
+    fi
+
+    # id (до @)
+    id="${rest%%@*}"
+    rest="${rest#*@}"
+
+    # host:port (до ?)
+    local hostport="${rest%%\?*}"
+    local query=""
+    if [[ "$rest" == *"?"* ]]; then
+        query="${rest#*\?}"
+    fi
+
+    # IPv6 или обычный host:port
+    if [[ "$hostport" == "["* ]]; then
+        address="${hostport%%]*}"
+        address="${address#[}"
+        port="${hostport##*]:}"
+    else
+        address="${hostport%%:*}"
+        port="${hostport##*:}"
+    fi
+
+    # query-параметры
+    declare -gA params
+    local IFS='&'
+    for pair in $query; do
+        local k="${pair%%=*}"
+        local v="${pair#*=}"
+        v=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$v" 2>/dev/null || printf '%s' "$v")
+        params["$k"]="$v"
+    done
+
+    # Присваиваем глобальные переменные (без local!)
+    publickey="${params[pbk]:-}"
+    fingerprint="${params[fp]:-}"
+    servername="${params[sni]:-}"
+    shortid="${params[sid]:-}"
+    security="${params[security]:-}"
+    type="${params[type]:-}"
+    flow="${params[flow]:-}"
+    encryption="${params[encryption]:-}"
+}
+
+# ─── 2. ГЕОФАЙЛЫ. МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────
+
+update_geo_files() {
+    echo ">>> Обновление geo-файлов..."
+    rm -f /usr/local/share/xray/*
+    wget -q --show-progress -P /usr/local/share/xray/ \
+        https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
+    wget -q --show-progress -P /usr/local/share/xray/ \
+        https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
+}
+
+backup_config() {
+    echo ">>> Создание резервной копии config.json..."
+    cp /usr/local/etc/xray/config.json /usr/local/etc/xray/config.backup
+}
+
+patch_routing() {
+    echo ">>> Обновление routing rules..."
+    jq --arg name "$name" \
+    '.routing.rules = [
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "domain": [
+          "ext:geosite.dat:ru-available-only-inside",
+          "regexp:.*\\.ru$",
+          "regexp:.*\\.su$",
+          "regexp:.*\\.xn--p1ai$"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "ip": ["ext:geoip.dat:ru"]
+      },
+      {
+        "type": "field",
+        "outboundTag": "block",
+        "domain": ["geosite:category-ads-all"]
+      },
+      {
+        "type": "field",
+        "outboundTag": $name,
+        "network": "TCP,UDP"
+      }
+    ]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
+}
+
+write_renew_script() {
+    echo ">>> Создание скрипта обновления geo-файлов..."
+    cat > /usr/local/share/xray/renewgeofiles << 'EOF'
+#!/bin/bash
+rm /usr/local/share/xray/*
+wget -P /usr/local/share/xray/ https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
+wget -P /usr/local/share/xray/ https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
+systemctl restart xray
+EOF
+    chmod +x /usr/local/share/xray/renewgeofiles
+}
+
+restart_xray() {
+    echo ">>> Перезапуск Xray..."
+    systemctl restart xray
+    systemctl status xray
+}
+
+# ─── 3. OUTBOUND: XHTTP (type=xhttp) ─────────────────────────────────────────
+
+patch_outbound_xhttp() {
+    echo ">>> Применение outbound конфига: xhttp / REALITY..."
+    jq --arg address      "$address" \
+       --argjson port     "$port" \
+       --arg id           "$id" \
+       --arg name         "$name" \
+       --arg publickey    "$publickey" \
+       --arg fingerprint  "$fingerprint" \
+       --arg servername   "$servername" \
+       --arg shortid      "$shortid" \
+    '
+    .outbounds = (
+      .outbounds | map(select(.tag != "direct"))
+    ) + [
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {
+          "domainStrategy": "AsIs",
+          "redirect": "",
+          "noises": []
+        }
+      },
+      {
+        "protocol": "vless",
+        "settings": {
+          "address": $address,
+          "port": $port,
+          "id": $id,
+          "flow": "",
+          "encryption": "none"
+        },
+        "tag": $name,
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "reality",
+          "realitySettings": {
+            "publicKey": $publickey,
+            "fingerprint": $fingerprint,
+            "serverName": $servername,
+            "shortId": $shortid,
+            "spiderX": "/",
+            "mldsa65Verify": ""
+          },
+          "xhttpSettings": {
+            "path": "/",
+            "host": "",
+            "mode": "auto",
+            "noGRPCHeader": false,
+            "scMinPostsIntervalMs": "30",
+            "xmux": {
+              "maxConcurrency": "16-32",
+              "maxConnections": 0,
+              "cMaxReuseTimes": 0,
+              "hMaxRequestTimes": "600-900",
+              "hMaxReusableSecs": "1800-3000",
+              "hKeepAlivePeriod": 0
+            }
+          }
+        }
+      }
+    ]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
+}
+
+# ─── 4. OUTBOUND: TCP (type=tcp) ─────────────────────────────────────────────
+
+patch_outbound_tcp() {
+    echo ">>> Применение outbound конфига: tcp / REALITY + xtls-rprx-vision..."
+    jq --arg address      "$address" \
+       --argjson port     "$port" \
+       --arg id           "$id" \
+       --arg name         "$name" \
+       --arg publickey    "$publickey" \
+       --arg fingerprint  "$fingerprint" \
+       --arg servername   "$servername" \
+       --arg shortid      "$shortid" \
+    '
+    .outbounds = (
+      .outbounds | map(select(.tag != "direct"))
+    ) + [
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {
+          "domainStrategy": "AsIs",
+          "redirect": "",
+          "noises": []
+        }
+      },
+      {
+        "protocol": "vless",
+        "settings": {
+          "address": $address,
+          "port": $port,
+          "id": $id,
+          "flow": "xtls-rprx-vision",
+          "encryption": "none",
+          "testseed": [900, 500, 900, 256]
+        },
+        "tag": $name,
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "publicKey": $publickey,
+            "fingerprint": $fingerprint,
+            "serverName": $servername,
+            "shortId": $shortid,
+            "spiderX": "/",
+            "mldsa65Verify": ""
+          },
+          "tcpSettings": {
+            "header": {
+              "type": "none"
+            }
+          }
+        }
+      }
+    ]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
+}
+
+# ─── 5. ТОЧКА ВХОДА ───────────────────────────────────────────────────────────
+
+main() {
+    local vless_url="${1:-}"
+
+    if [[ -z "$vless_url" ]]; then
+        read -rp "Вставьте vless-ссылку: " vless_url
+    fi
+
+    # Парсим ссылку → заполняем глобальные переменные
+    parse_vless "$vless_url"
+
+    echo ""
+    echo "=== Параметры подключения ==="
+    echo "  name:        $name"
+    echo "  address:     $address"
+    echo "  port:        $port"
+    echo "  type:        $type"
+    echo "  security:    $security"
+    echo "  servername:  $servername"
+    echo ""
+
+    update_geo_files
+    backup_config
+    patch_routing
+
+    # Выбор outbound по значению type
+    case "$type" in
+        xhttp)
+            patch_outbound_xhttp
+            ;;
+        tcp)
+            patch_outbound_tcp
+            ;;
+        *)
+            echo "Error: неизвестный type='$type'. Поддерживаются: xhttp, tcp." >&2
+            exit 1
+            ;;
+    esac
+
+    write_renew_script
+    restart_xray
+}
+
+main "$@"
