@@ -37,6 +37,7 @@ apt install python3
 ---
 
 ## Использование скрипта
+Скрипт запускается на входящем (российском) сервере
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/ServerTechnologies/cascade-for-x-ray/refs/heads/main/cascad | bash
